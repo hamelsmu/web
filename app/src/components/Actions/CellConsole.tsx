@@ -15,12 +15,75 @@ import { ClientMessages, setContext } from "@runmedev/renderers";
 
 import { MimeType, RunmeMetadataKey, parser_pb } from "../../runme/client";
 import { CellData } from "../../lib/notebookData";
-import { maybeParseIPykernelMessage } from "../../lib/ipykernel";
+import { maybeParseIPykernelMessage, type IPykernelMessage } from "../../lib/ipykernel";
 
 export const fontSettings = {
   fontSize: 12,
   fontFamily: "monospace",
 };
+
+/**
+ * Extract displayable text from an IPykernel message.
+ * - "stream" messages contain print() output in content.text
+ * - "error" messages contain exception info in content.ename/evalue/traceback
+ * Returns the text to write to the terminal, or null if the message
+ * is a control message that should be silently ignored.
+ */
+/**
+ * Known IPykernel control message types that carry no displayable output.
+ * These are silently ignored so they don't clutter the terminal.
+ */
+const SILENT_MSG_TYPES = new Set([
+  "status",
+  "execute_input",
+  "comm_open",
+  "comm_msg",
+  "comm_close",
+  "clear_output",
+]);
+
+function extractIopubText(msg: IPykernelMessage): string | null | "passthrough" {
+  const msgType = msg.header?.msg_type ?? (msg as any).msg_type;
+
+  if (msgType === "stream") {
+    const text = typeof msg.content?.text === "string" ? msg.content.text : "";
+    return text || null;
+  }
+
+  if (msgType === "error") {
+    const ename = (msg.content as any)?.ename ?? "";
+    const evalue = (msg.content as any)?.evalue ?? "";
+    const traceback: string[] = Array.isArray((msg.content as any)?.traceback)
+      ? (msg.content as any).traceback
+      : [];
+    const text = [ename, evalue, ...traceback].filter(Boolean).join("\n");
+    return text ? text + "\n" : null;
+  }
+
+  if (
+    msgType === "execute_result" ||
+    msgType === "display_data" ||
+    msgType === "update_display_data"
+  ) {
+    const data = (msg.content as any)?.data;
+    const plain = data?.["text/plain"];
+    const text =
+      typeof plain === "string"
+        ? plain
+        : Array.isArray(plain)
+          ? plain.join("")
+          : "";
+    return text ? text + "\n" : null;
+  }
+
+  if (SILENT_MSG_TYPES.has(msgType ?? "")) {
+    return null;
+  }
+
+  // Unknown message type — fall through to raw output so we don't
+  // silently drop user-printed JSON that happens to match the heuristic.
+  return "passthrough";
+}
 
 const textDecoder = new TextDecoder();
 const textEncoder = new TextEncoder();
@@ -210,11 +273,15 @@ const CellConsole = ({ cellData, onExitCode, onPid }: CellConsoleProps) => {
         return;
       }
       stdoutBufferRef.current = "";
-      // N.B. Right now CellConsole subscribes to the raw stream from the kernel.
-      // So we need to filter out any IPykernel control messages. 
-      // We might want to refactor the code so that we create a filtered in bindStreamsToCell
-      // which contains only the actual stdout/stderr output after filtering out the control messages.
-      if (!maybeParseIPykernelMessage(pending)) {
+      const parsed = maybeParseIPykernelMessage(pending);
+      if (parsed) {
+        const result = extractIopubText(parsed);
+        if (result === "passthrough") {
+          writeToTerminal(textEncoder.encode(pending));
+        } else if (result) {
+          writeToTerminal(textEncoder.encode(result));
+        }
+      } else {
         writeToTerminal(textEncoder.encode(pending));
       }
     };
@@ -228,7 +295,14 @@ const CellConsole = ({ cellData, onExitCode, onPid }: CellConsoleProps) => {
         stdoutBufferRef.current = lines.pop() ?? "";
 
         lines.forEach((line) => {
-          if (maybeParseIPykernelMessage(line)) {
+          const parsed = maybeParseIPykernelMessage(line);
+          if (parsed) {
+            const result = extractIopubText(parsed);
+            if (result === "passthrough") {
+              writeToTerminal(textEncoder.encode(`${line}\n`));
+            } else if (result) {
+              writeToTerminal(textEncoder.encode(result));
+            }
             return;
           }
           writeToTerminal(textEncoder.encode(`${line}\n`));
